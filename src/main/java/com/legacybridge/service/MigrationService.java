@@ -5,12 +5,15 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.RestClientException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import org.springframework.web.client.RestTemplate;
 
 @Service
 public class MigrationService {
@@ -21,7 +24,7 @@ public class MigrationService {
     @Value("${google.ai.api.key:AIzaSyD1q3p2yHe6RokwNJBYSIXRqC19K35NNDM}")
     private String apiKey;
 
-    @Value("${google.ai.api.url:https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent}")
+    @Value("${google.ai.api.url:https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent}")
     private String apiUrl;
 
     private final RestTemplate restTemplate = new RestTemplate();
@@ -43,18 +46,34 @@ public class MigrationService {
         // LLM Call for Summary and Patterns
         String prompt = "Analyze this legacy code and provide: 1. summary (plain English), 2. patterns (IDs matching [GOD_CLASS, HARDCODED_CONFIG, SPAGHETTI_LOGIC, LEGACY_UI_MIX, STALE_DB_CONN]). Return ONLY absolute JSON. Code: " + code;
         String llmResponse = callGemini(prompt);
-
+        System.out.println("LLM Response: " + llmResponse);
+//        log.info("LLM Response: " + llmResponse);
         String summary = "Analysis failed";
         List<String> patterns = new ArrayList<>();
 
         try {
-            JsonNode root = objectMapper.readTree(llmResponse.replaceAll("```json|```", "").trim());
-            summary = root.path("summary").asText("No summary provided");
-            JsonNode patternsNode = root.path("patterns");
-            if (patternsNode.isArray()) {
-                patternsNode.forEach(p -> patterns.add(p.asText()));
+            // Remove potential markdown formatting from LLM response
+            String cleanJson = llmResponse.replaceAll("(?s)```json\\s*(.*?)\\s*```", "$1")
+                    .replaceAll("(?s)```\\s*(.*?)\\s*```", "$1")
+                    .trim();
+
+            // Basic check if it looks like JSON
+            if (cleanJson.startsWith("{")) {
+                JsonNode root = objectMapper.readTree(cleanJson);
+                if (root.has("error")) {
+                    summary = "LLM API error: " + root.path("error").asText(root.path("error").toString());
+                } else {
+                    summary = root.path("summary").asText("No summary provided");
+                    JsonNode patternsNode = root.path("patterns");
+                    if (patternsNode.isArray()) {
+                        patternsNode.forEach(p -> patterns.add(p.asText()));
+                    }
+                }
+            } else {
+                summary = "LLM Response was not valid JSON: " + (cleanJson.length() > 100 ? cleanJson.substring(0, 100) + "..." : cleanJson);
             }
         } catch (Exception e) {
+            summary = "Failed to parse LLM response: " + e.getMessage();
             e.printStackTrace();
         }
 
@@ -91,18 +110,62 @@ public class MigrationService {
 
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
 
-            String response = restTemplate.postForObject(url, entity, String.class);
+            String response;
+            try {
+                response = restTemplate.postForObject(url, entity, String.class);
+            } catch (HttpClientErrorException e) {
+                String errorMsg = "API Error: " + e.getStatusCode();
+                String body = e.getResponseBodyAsString();
+                if (body != null && !body.isBlank()) {
+                    try {
+                        JsonNode errorJson = objectMapper.readTree(body);
+                        if (errorJson.has("error")) {
+                            JsonNode error = errorJson.path("error");
+                            errorMsg += " - " + error.path("message").asText(error.toString());
+                        } else {
+                            errorMsg += " - " + body;
+                        }
+                    } catch (Exception ignored) {
+                        errorMsg += " - " + body;
+                    }
+                } else {
+                    errorMsg += " - " + e.getMessage();
+                }
+                return objectMapper.createObjectNode().put("error", errorMsg).toString();
+            } catch (RestClientException e) {
+                return objectMapper.createObjectNode().put("error", "Request failed: " + e.getMessage()).toString();
+            }
+
+            if (response == null || response.trim().isEmpty()) {
+                return objectMapper.createObjectNode().put("error", "Empty response from Gemini API").toString();
+            }
+
             JsonNode responseJson = objectMapper.readTree(response);
 
-            return responseJson.path("candidates")
-                    .get(0)
-                    .path("content")
-                    .path("parts")
-                    .get(0)
-                    .path("text")
-                    .asText();
+            if (responseJson.has("error")) {
+                JsonNode error = responseJson.path("error");
+                String errorMsg;
+                if (error.isObject()) {
+                    errorMsg = error.path("message").asText(error.toString());
+                } else {
+                    errorMsg = error.asText("Unknown error");
+                }
+                return objectMapper.createObjectNode().put("error", errorMsg).toString();
+            }
+
+            JsonNode candidates = responseJson.path("candidates");
+            if (candidates.isArray() && candidates.size() > 0) {
+                return candidates.get(0)
+                        .path("content")
+                        .path("parts")
+                        .get(0)
+                        .path("text")
+                        .asText();
+            }
+
+            return objectMapper.createObjectNode().put("error", "No candidates in response").toString();
         } catch (Exception e) {
-            return "{\"error\": \"" + e.getMessage() + "\"}";
+            return objectMapper.createObjectNode().put("error", e.getMessage()).toString();
         }
     }
 
